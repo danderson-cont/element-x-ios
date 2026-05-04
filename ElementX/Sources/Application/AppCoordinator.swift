@@ -1163,15 +1163,24 @@ class AppCoordinator: AppCoordinatorProtocol, AuthenticationFlowCoordinatorDeleg
             return
         }
         
+        // The closure passed to beginBackgroundTask is the expiration handler,
+        // not the work block. iOS only invokes it once our background time has
+        // run out, so the actual sync stop has to run outside of it. Otherwise
+        // SQLite write transactions held by the sync loop are only released
+        // when iOS is already mid-teardown, which can surface as background
+        // terminations on tighter background budgets.
         backgroundTask = appMediator.beginBackgroundTask {
-            MXLog.info("Background task is about to expire.")
-            
+            MXLog.warning("Background task expiring before sync stop completed.")
+
             // We're intentionally strongly retaining self here to an EXC_BAD_ACCESS
             // `backgroundTask` will be eventually released in `endActiveBackgroundTask`
             // https://sentry.tools.element.io/organizations/element/issues/4477794/events/9cfd04e4d045440f87498809cf718de5/
-            self.stopSync(isBackgroundTask: true) {
-                self.endActiveBackgroundTask()
-            }
+            self.endActiveBackgroundTask()
+        }
+
+        stopSync(isBackgroundTask: true) {
+            // See above comment about intentional strong capture
+            self.endActiveBackgroundTask()
         }
     }
     
