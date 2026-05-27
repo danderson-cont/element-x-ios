@@ -31,6 +31,7 @@ class ElementCallService: NSObject, ElementCallServiceProtocol, PKPushRegistryDe
     private let pushRegistry: PKPushRegistry
     private let callController = CXCallController()
     private let callProvider: CXProviderProtocol
+    private let phantomCallProvider: CXProviderProtocol
     private let timeProvider: TimeProvider
     
     private weak var clientProxy: ClientProxyProtocol? {
@@ -67,27 +68,12 @@ class ElementCallService: NSObject, ElementCallServiceProtocol, PKPushRegistryDe
     
     private var declineListenerHandle: TaskHandle?
     
-    init(callProvider: CXProviderProtocol? = nil, timeProvider: TimeProvider? = nil) {
+    init(callProvider: CXProviderProtocol? = nil, phantomCallProvider: CXProviderProtocol? = nil, timeProvider: TimeProvider? = nil) {
         pushRegistry = PKPushRegistry(queue: nil)
         
         self.timeProvider = timeProvider ?? TimeProvider(clock: ContinuousClock(), now: Date.init)
-        
-        if let callProvider {
-            self.callProvider = callProvider
-        } else {
-            let configuration = CXProviderConfiguration()
-            configuration.supportsVideo = true
-            configuration.includesCallsInRecents = true
-            
-            if let callKitIcon = UIImage(named: "images/app-logo") {
-                configuration.iconTemplateImageData = callKitIcon.pngData()
-            }
-            
-            // https://stackoverflow.com/a/46077628/730924
-            configuration.supportedHandleTypes = [.generic]
-            
-            self.callProvider = CXProvider(configuration: configuration)
-        }
+        self.callProvider = callProvider ?? ElementCallService.makeCallProvider(includesCallsInRecents: true)
+        self.phantomCallProvider = phantomCallProvider ?? ElementCallService.makeCallProvider(includesCallsInRecents: false)
         
         super.init()
         
@@ -95,6 +81,22 @@ class ElementCallService: NSObject, ElementCallServiceProtocol, PKPushRegistryDe
         pushRegistry.desiredPushTypes = [.voIP]
         
         self.callProvider.setDelegate(self, queue: nil)
+        self.phantomCallProvider.setDelegate(self, queue: nil)
+    }
+    
+    private static func makeCallProvider(includesCallsInRecents: Bool) -> CXProvider {
+        let configuration = CXProviderConfiguration()
+        configuration.supportsVideo = true
+        configuration.includesCallsInRecents = includesCallsInRecents
+        
+        if let callKitIcon = UIImage(named: "images/app-logo") {
+            configuration.iconTemplateImageData = callKitIcon.pngData()
+        }
+        
+        // https://stackoverflow.com/a/46077628/730924
+        configuration.supportedHandleTypes = [.generic]
+        
+        return CXProvider(configuration: configuration)
     }
     
     func setClientProxy(_ clientProxy: any ClientProxyProtocol) {
@@ -162,19 +164,25 @@ class ElementCallService: NSObject, ElementCallServiceProtocol, PKPushRegistryDe
     func pushRegistry(_ registry: PKPushRegistry, didReceiveIncomingPushWith payload: PKPushPayload, for type: PKPushType, completion: @escaping () -> Void) {
         guard let roomID = payload.dictionaryPayload[ElementCallServiceNotificationKey.roomID.rawValue] as? String else {
             MXLog.error("Something went wrong, missing room identifier for incoming voip call: \(payload)")
-            completion()
+            assertionFailure("Incoming voip push is missing the room identifier")
+            reportImmediatelyEndedCall(reason: .failed, completion: completion)
             return
         }
         
         guard let rtcNotificationID = payload.dictionaryPayload[ElementCallServiceNotificationKey.rtcNotifyEventID.rawValue] as? String else {
             MXLog.error("Something went wrong, missing rtc notification event identifier for incoming voip call: \(payload)")
-            completion()
+            assertionFailure("Incoming voip push is missing the rtc notification event identifier")
+            reportImmediatelyEndedCall(reason: .failed, completion: completion)
             return
         }
         
+        let roomDisplayName = payload.dictionaryPayload[ElementCallServiceNotificationKey.roomDisplayName.rawValue] as? String
+        
         guard ongoingCallID?.roomID != roomID else {
-            MXLog.warning("Call already ongoing for room \(roomID), ignoring incoming push")
-            completion()
+            MXLog.warning("Call already ongoing for room \(roomID), reporting the duplicate push as handled")
+            reportImmediatelyEndedCall(reason: .answeredElsewhere,
+                                       callerInfo: (roomID: roomID, roomDisplayName: roomDisplayName),
+                                       completion: completion)
             return
         }
         
@@ -185,21 +193,25 @@ class ElementCallService: NSObject, ElementCallServiceProtocol, PKPushRegistryDe
         
         guard let expirationDate = (payload.dictionaryPayload[ElementCallServiceNotificationKey.expirationDate.rawValue] as? Date) else {
             MXLog.error("Something went wrong, missing expiration timestamp for incoming voip call: \(payload)")
-            completion()
+            assertionFailure("Incoming voip push is missing the expiration timestamp")
+            clearIncomingCallState()
+            reportImmediatelyEndedCall(reason: .failed, completion: completion)
             return
         }
         
         let nowDate = timeProvider.now()
         
         guard nowDate < expirationDate else {
-            MXLog.warning("Call expired for room \(roomID), ignoring incoming push")
-            completion()
+            MXLog.warning("Call expired for room \(roomID), reporting it as missed")
+            clearIncomingCallState()
+            reportImmediatelyEndedCall(reason: .unanswered,
+                                       callerInfo: (roomID: roomID, roomDisplayName: roomDisplayName),
+                                       visibleInRecents: true,
+                                       completion: completion)
             return
         }
         
         let ringDuration: Duration = .seconds(min(expirationDate.timeIntervalSince1970 - nowDate.timeIntervalSince1970, 90))
-        
-        let roomDisplayName = payload.dictionaryPayload[ElementCallServiceNotificationKey.roomDisplayName.rawValue] as? String
         
         let update = CXCallUpdate()
         // Work Around: Always set video to true! https://github.com/element-hq/element-x-ios/issues/5335
@@ -332,6 +344,39 @@ class ElementCallService: NSObject, ElementCallServiceProtocol, PKPushRegistryDe
         }
         
         ongoingCallID = nil
+    }
+    
+    /// Every VoIP push must be reported to CallKit via `reportNewIncomingCall`, otherwise iOS
+    /// terminates the app with `NSInternalInconsistencyException`. On early-return paths we report
+    /// a call and immediately end it. `callerInfo` names the call so the brief system UI flash
+    /// doesn't show "Unknown". When `visibleInRecents` is set it goes through the main provider,
+    /// showing up in Recents named after the room and tappable to call back; otherwise through
+    /// `phantomCallProvider`, leaving no trace in Recents.
+    private func reportImmediatelyEndedCall(reason: CXCallEndedReason,
+                                            callerInfo: (roomID: String, roomDisplayName: String?)? = nil,
+                                            visibleInRecents: Bool = false,
+                                            completion: @escaping () -> Void) {
+        let provider = visibleInRecents ? callProvider : phantomCallProvider
+        
+        let callID = UUID()
+        let update = CXCallUpdate()
+        // Never answered through CallKit, so the hasVideo workaround for #5335 isn't needed.
+        update.hasVideo = false
+        
+        if let callerInfo {
+            update.localizedCallerName = callerInfo.roomDisplayName
+            update.remoteHandle = .init(type: .generic, value: callerInfo.roomID)
+        }
+        
+        provider.reportNewIncomingCall(with: callID, update: update) { error in
+            if let error {
+                MXLog.error("Failed reporting immediately ended call with error: \(error)")
+            }
+            
+            provider.reportCall(with: callID, endedAt: nil, reason: reason)
+            
+            completion()
+        }
     }
     
     private func sendDeclineCallEvent(_ incomingCallID: CallID) async {

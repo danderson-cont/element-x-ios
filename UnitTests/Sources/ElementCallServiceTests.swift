@@ -5,6 +5,7 @@
 // Please see LICENSE files in the repository root for full details.
 //
 
+import CallKit
 import Clocks
 @testable import ElementX
 import PushKit
@@ -13,6 +14,7 @@ import Testing
 @MainActor
 final class ElementCallServiceTests {
     private var callProvider: CXProviderMock!
+    private var phantomCallProvider: CXProviderMock!
     private var currentDate: Date!
     private var testClock: TestClock<Duration>!
     private var pushRegistry: PKPushRegistry!
@@ -21,16 +23,20 @@ final class ElementCallServiceTests {
     init() {
         pushRegistry = PKPushRegistry(queue: nil)
         callProvider = CXProviderMock(.init())
+        phantomCallProvider = CXProviderMock(.init())
         currentDate = Date()
         testClock = TestClock()
         let dateProvider: () -> Date = {
             self.currentDate
         }
-        service = ElementCallService(callProvider: callProvider, timeProvider: TimeProvider(clock: testClock, now: dateProvider))
+        service = ElementCallService(callProvider: callProvider,
+                                     phantomCallProvider: phantomCallProvider,
+                                     timeProvider: TimeProvider(clock: testClock, now: dateProvider))
     }
     
     deinit {
         callProvider = nil
+        phantomCallProvider = nil
         currentDate = nil
         testClock = nil
         pushRegistry = nil
@@ -107,22 +113,6 @@ final class ElementCallServiceTests {
             // advance past the timeout
             await testClock.advance(by: .seconds(30))
         }
-    }
-    
-    @Test
-    func expiredRingLifetimeIsIgnored() {
-        #expect(!callProvider.reportNewIncomingCallWithUpdateCompletionCalled)
-        
-        let pushPayload = PKPushPayloadMock().updatingExpiration(currentDate, lifetime: 20)
-        
-        currentDate = currentDate.addingTimeInterval(60)
-        
-        service.pushRegistry(pushRegistry,
-                             didReceiveIncomingPushWith: pushPayload,
-                             for: .voIP) { }
-        sleep(20)
-        
-        #expect(!callProvider.reportNewIncomingCallWithUpdateCompletionCalled)
     }
     
     @Test
@@ -222,6 +212,57 @@ final class ElementCallServiceTests {
         }
         
         #expect(!unansweredFired, "endUnansweredCallTask should have been cancelled by setupCallSession")
+    }
+    
+    @Test
+    func expiredPushReportsMissedCall() async {
+        // An expired push is a real call we missed, so it should show up in Recents as one.
+        let pushPayload = PKPushPayloadMock().updatingExpiration(currentDate, lifetime: 20)
+        currentDate = currentDate.addingTimeInterval(60)
+        await expectImmediatelyEndedCallReported(forPayload: pushPayload, expectedReason: .unanswered, on: callProvider)
+        
+        let update = callProvider.reportNewIncomingCallWithUpdateCompletionReceivedArguments?.update
+        #expect(update?.localizedCallerName == "welcome")
+        #expect(update?.remoteHandle?.value == "!room:example.com")
+    }
+    
+    @Test
+    func duplicateRoomPushReportsCallAsHandled() async {
+        // A duplicate push for an ongoing call is reported as handled, without touching Recents.
+        await service.setupCallSession(roomID: "!room:example.com", roomDisplayName: "welcome")
+        let pushPayload = PKPushPayloadMock().updatingExpiration(currentDate, lifetime: 30)
+        await expectImmediatelyEndedCallReported(forPayload: pushPayload, expectedReason: .answeredElsewhere, on: phantomCallProvider)
+        
+        // The call should be named so the brief system UI flash doesn't show "Unknown".
+        let update = phantomCallProvider.reportNewIncomingCallWithUpdateCompletionReceivedArguments?.update
+        #expect(update?.localizedCallerName == "welcome")
+        
+        #expect(service.ongoingCallRoomIDPublisher.value == "!room:example.com")
+    }
+    
+    private func expectImmediatelyEndedCallReported(forPayload payload: PKPushPayloadMock,
+                                                    expectedReason: CXCallEndedReason,
+                                                    on expectedProvider: CXProviderMock) async {
+        let otherProvider: CXProviderMock = expectedProvider === callProvider ? phantomCallProvider : callProvider
+        
+        let baselineNewIncomingCount = expectedProvider.reportNewIncomingCallWithUpdateCompletionCallsCount
+        let baselineEndedCount = expectedProvider.reportCallWithEndedAtReasonCallsCount
+        
+        await confirmation { confirmation in
+            service.pushRegistry(pushRegistry, didReceiveIncomingPushWith: payload, for: .voIP) {
+                confirmation()
+            }
+        }
+        
+        #expect(expectedProvider.reportNewIncomingCallWithUpdateCompletionCallsCount == baselineNewIncomingCount + 1)
+        #expect(expectedProvider.reportCallWithEndedAtReasonCallsCount == baselineEndedCount + 1)
+        #expect(!otherProvider.reportNewIncomingCallWithUpdateCompletionCalled)
+        #expect(!otherProvider.reportCallWithEndedAtReasonCalled)
+        
+        let reportedCall = expectedProvider.reportNewIncomingCallWithUpdateCompletionReceivedArguments
+        let endedCall = expectedProvider.reportCallWithEndedAtReasonReceivedArguments
+        #expect(reportedCall?.uuid == endedCall?.uuid)
+        #expect(endedCall?.reason == expectedReason)
     }
 }
 
